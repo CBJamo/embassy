@@ -263,8 +263,18 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Blocking, FLASH_SIZE
 
 impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
     /// Create a new flash driver in async mode.
-    pub fn new(_flash: impl Peripheral<P = T> + 'd, dma: impl Peripheral<P = impl Channel> + 'd) -> Self {
-        into_ref!(dma);
+    pub fn new(
+        _flash: impl Peripheral<P = T> + 'd,
+        dma: impl Peripheral<P = impl Channel> + 'd,
+        pin: impl Peripheral<P = impl crate::gpio::Pin>,
+    ) -> Self {
+        into_ref!(dma, pin);
+        pin.gpio().ctrl().write(|w| {
+            w.set_funcsel(pac::io::vals::Gpio0ctrlFuncsel::XIP_SS_N_1 as _);
+        });
+        pin.pad_ctrl().write(|w| {
+            w.set_iso(false);
+        });
         Self {
             dma: Some(dma.map_into()),
             phantom: PhantomData,
