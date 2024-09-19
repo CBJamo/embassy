@@ -50,6 +50,18 @@ pub enum FifoJoin {
     RxOnly,
     /// Tx fifo twice as deep. RX fifo disabled
     TxOnly,
+    /// Enable random writes (`FJOIN_RX_PUT`) from the state machine (through ISR),
+    /// and random reads from the system (using [`StateMachine::get_rxf_entry`]).
+    #[cfg(feature = "_rp235x")]
+    RxAsStatus,
+    /// Enable random reads (`FJOIN_RX_GET`) from the state machine (through OSR),
+    /// and random writes from the system (using [`StateMachine::set_rxf_entry`]).
+    #[cfg(feature = "_rp235x")]
+    RxAsControl,
+    /// FJOIN_RX_PUT | FJOIN_RX_GET: RX can be used as a scratch register,
+    /// not accesible from the CPU
+    #[cfg(feature = "_rp235x")]
+    PioScratch,
 }
 
 /// Shift direction.
@@ -655,10 +667,6 @@ impl<'d, PIO: Instance> Config<'d, PIO> {
 
     /// Set pin used to signal jump.
     pub fn set_jmp_pin(&mut self, pin: &Pin<'d, PIO>) {
-        #[cfg(feature = "_rp235x")]
-        pin.pin.pad_ctrl().modify(|w| {
-            w.set_iso(false);
-        });
         self.exec.jmp_pin = pin.pin();
     }
 
@@ -668,12 +676,6 @@ impl<'d, PIO: Instance> Config<'d, PIO> {
     pub fn set_set_pins(&mut self, pins: &[&Pin<'d, PIO>]) {
         assert!(pins.len() <= 5);
         assert_consecutive(pins);
-        #[cfg(feature = "_rp235x")]
-        for pin in pins {
-            pin.pin.pad_ctrl().modify(|w| {
-                w.set_iso(false);
-            })
-        }
         self.pins.set_base = pins.first().map_or(0, |p| p.pin());
         self.pins.set_count = pins.len() as u8;
     }
@@ -683,12 +685,6 @@ impl<'d, PIO: Instance> Config<'d, PIO> {
     /// effective.
     pub fn set_out_pins(&mut self, pins: &[&Pin<'d, PIO>]) {
         assert_consecutive(pins);
-        #[cfg(feature = "_rp235x")]
-        for pin in pins {
-            pin.pin.pad_ctrl().modify(|w| {
-                w.set_iso(false);
-            })
-        }
         self.pins.out_base = pins.first().map_or(0, |p| p.pin());
         self.pins.out_count = pins.len() as u8;
     }
@@ -698,12 +694,6 @@ impl<'d, PIO: Instance> Config<'d, PIO> {
     /// effective.
     pub fn set_in_pins(&mut self, pins: &[&Pin<'d, PIO>]) {
         assert_consecutive(pins);
-        #[cfg(feature = "_rp235x")]
-        for pin in pins {
-            pin.pin.pad_ctrl().modify(|w| {
-                w.set_iso(false);
-            })
-        }
         self.pins.in_base = pins.first().map_or(0, |p| p.pin());
         self.in_count = pins.len() as u8;
     }
@@ -752,6 +742,16 @@ impl<'d, PIO: Instance + 'd, const SM: usize> StateMachine<'d, PIO, SM> {
             w.set_in_shiftdir(config.shift_in.direction == ShiftDirection::Right);
             w.set_autopull(config.shift_out.auto_fill);
             w.set_autopush(config.shift_in.auto_fill);
+
+            #[cfg(feature = "_rp235x")]
+            {
+                w.set_fjoin_rx_get(
+                    config.fifo_join == FifoJoin::RxAsControl || config.fifo_join == FifoJoin::PioScratch,
+                );
+                w.set_fjoin_rx_put(
+                    config.fifo_join == FifoJoin::RxAsStatus || config.fifo_join == FifoJoin::PioScratch,
+                );
+            }
         });
 
         #[cfg(feature = "rp2040")]
@@ -977,6 +977,20 @@ impl<'d, PIO: Instance + 'd, const SM: usize> StateMachine<'d, PIO, SM> {
     pub fn rx_tx(&mut self) -> (&mut StateMachineRx<'d, PIO, SM>, &mut StateMachineTx<'d, PIO, SM>) {
         (&mut self.rx, &mut self.tx)
     }
+
+    /// Return the contents of the nth entry of the RX FIFO
+    /// (should be used only when the FIFO config is set to [`FifoJoin::RxAsStatus`])
+    #[cfg(feature = "_rp235x")]
+    pub fn get_rxf_entry(&self, n: usize) -> u32 {
+        PIO::PIO.rxf_putget(SM).putget(n).read()
+    }
+
+    /// Set the contents of the nth entry of the RX FIFO
+    /// (should be used only when the FIFO config is set to [`FifoJoin::RxAsControl`])
+    #[cfg(feature = "_rp235x")]
+    pub fn set_rxf_entry(&self, n: usize, val: u32) {
+        PIO::PIO.rxf_putget(SM).putget(n).write_value(val)
+    }
 }
 
 /// PIO handle.
@@ -1124,6 +1138,10 @@ impl<'d, PIO: Instance> Common<'d, PIO> {
     pub fn make_pio_pin(&mut self, pin: impl Peripheral<P = impl PioPin + 'd> + 'd) -> Pin<'d, PIO> {
         into_ref!(pin);
         pin.gpio().ctrl().write(|w| w.set_funcsel(PIO::FUNCSEL as _));
+        #[cfg(feature = "_rp235x")]
+        pin.pad_ctrl().modify(|w| {
+            w.set_iso(false);
+        });
         // we can be relaxed about this because we're &mut here and nothing is cached
         PIO::state().used_pins.fetch_or(1 << pin.pin_bank(), Ordering::Relaxed);
         Pin {

@@ -14,18 +14,24 @@ src_base = "https://github.com/embassy-rs/embassy/blob/embassy-rp-v$VERSION/emba
 src_base_git = "https://github.com/embassy-rs/embassy/blob/$COMMIT/embassy-rp/src/"
 features = ["defmt", "unstable-pac", "time-driver"]
 flavors = [
-    { name = "rp2040", target = "thumbv6m-none-eabi", features = ["rp2040"] },
-    { name = "rp235xa", target = "thumbv8m.main-none-eabihf", features = ["rp235xa"] },
-    { name = "rp235xb", target = "thumbv8m.main-none-eabihf", features = ["rp235xb"] },
+    { name = "rp2040", target = "thumbv6m-none-eabi", features = [
+        "rp2040",
+    ] },
+    { name = "rp235xa", target = "thumbv8m.main-none-eabihf", features = [
+        "rp235xa",
+    ] },
+    { name = "rp235xb", target = "thumbv8m.main-none-eabihf", features = [
+        "rp235xb",
+    ] },
 ]
 
 [package.metadata.docs.rs]
 features = ["defmt", "unstable-pac", "time-driver"]
 
 [features]
-default = [ "rt" ]
+default = ["rt"]
 ## Enable the rt feature of [`rp-pac`](https://docs.rs/rp-pac). This brings in the [`cortex-m-rt`](https://docs.rs/cortex-m-rt) crate, which adds startup code and minimal runtime initialization.
-rt = [ "rp-pac/rt" ]
+rt = ["rp-pac/rt"]
 
 ## Enable [defmt support](https://docs.rs/defmt) and enables `defmt` debug-log messages and formatting in embassy drivers.
 defmt = ["dep:defmt", "embassy-usb-driver/defmt", "embassy-hal-internal/defmt"]
@@ -40,7 +46,10 @@ critical-section-impl = ["critical-section/restore-state-u8"]
 unstable-pac = []
 
 ## Enable the timer for use with `embassy-time` with a 1MHz tick rate.
-time-driver = ["dep:embassy-time-driver", "embassy-time-driver?/tick-hz-1_000_000"]
+time-driver = [
+    "dep:embassy-time-driver",
+    "embassy-time-driver?/tick-hz-1_000_000",
+]
 
 ## Enable ROM function cache. This will store the address of a ROM function when first used, improving performance of subsequent calls.
 rom-func-cache = []
@@ -92,7 +101,7 @@ boot2-none = []
 
 ## Configure the hal for use with the rp2040
 rp2040 = ["rp-pac/rp2040"]
-_rp235x = ["rp-pac/rp235x"]
+_rp235x = ["rp-pac/rp235x", "pio/rp2350", "pio-proc/rp2350"]
 ## Configure the hal for use with the rp235xA
 rp235xa = ["_rp235x"]
 ## Configure the hal for use with the rp235xB
@@ -112,9 +121,12 @@ embassy-sync = { version = "0.6.0", path = "../embassy-sync" }
 embassy-time-driver = { version = "0.1", path = "../embassy-time-driver", optional = true }
 embassy-time = { version = "0.3.2", path = "../embassy-time" }
 embassy-futures = { version = "0.1.0", path = "../embassy-futures" }
-embassy-hal-internal = {version = "0.2.0", path = "../embassy-hal-internal", features = ["cortex-m", "prio-bits-2"] }
-embassy-embedded-hal = {version = "0.2.0", path = "../embassy-embedded-hal" }
-embassy-usb-driver = {version = "0.1.0", path = "../embassy-usb-driver" }
+embassy-hal-internal = { version = "0.2.0", path = "../embassy-hal-internal", features = [
+    "cortex-m",
+    "prio-bits-2",
+] }
+embassy-embedded-hal = { version = "0.2.0", path = "../embassy-embedded-hal" }
+embassy-usb-driver = { version = "0.1.0", path = "../embassy-usb-driver" }
 atomic-polyfill = "1.0.1"
 defmt = { version = "0.3", optional = true }
 log = { version = "0.4.14", optional = true }
@@ -131,20 +143,31 @@ embedded-storage-async = { version = "0.4.1" }
 rand_core = "0.6.4"
 fixed = "1.23.1"
 
-rp-pac = { git = "https://github.com/embassy-rs/rp-pac.git", rev = "a7f42d25517f7124ad3b4ed492dec8b0f50a0e6c", feature = ["rt"] }
+rp-pac = { git = "https://github.com/embassy-rs/rp-pac.git", rev = "a7f42d25517f7124ad3b4ed492dec8b0f50a0e6c", feature = [
+    "rt",
+] }
 
-embedded-hal-02 = { package = "embedded-hal", version = "0.2.6", features = ["unproven"] }
+embedded-hal-02 = { package = "embedded-hal", version = "0.2.6", features = [
+    "unproven",
+] }
 embedded-hal-1 = { package = "embedded-hal", version = "1.0" }
 embedded-hal-async = { version = "1.0" }
 embedded-hal-nb = { version = "1.0" }
 
-pio-proc = {version= "0.2" }
-pio = {version= "0.2.1" }
+pio-proc = { version = "0.2" }
+pio = { version = "0.2.1" }
 rp2040-boot2 = "0.3"
 document-features = "0.2.7"
 sha2-const-stable = "0.1"
 rp-binary-info = { version = "0.1.0", optional = true }
 
 [dev-dependencies]
-embassy-executor = { version = "0.6.0", path = "../embassy-executor", features = ["arch-std", "executor-thread"] }
+embassy-executor = { version = "0.6.0", path = "../embassy-executor", features = [
+    "arch-std",
+    "executor-thread",
+] }
 static_cell = { version = "2" }
+
+[patch.crates-io]
+pio = { path = "/home/cbjamo/projects/pio-rs" }
+pio-proc = { path = "/home/cbjamo/projects/pio-rs/pio-proc" }

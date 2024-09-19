@@ -470,7 +470,7 @@ pub fn install_core0_stack_guard() -> Result<(), ()> {
     extern "C" {
         static mut _stack_end: usize;
     }
-    unsafe { install_stack_guard(core::ptr::addr_of_mut!(_stack_end)) }
+    install_stack_guard(core::ptr::addr_of_mut!(_stack_end))
 }
 
 #[cfg(all(feature = "rp2040", not(feature = "_test")))]
