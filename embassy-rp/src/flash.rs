@@ -271,6 +271,30 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
         }
     }
 
+    /// Create a new flash driver in async mode for two flash chips.
+    pub fn new_two_cs(
+        _flash: impl Peripheral<P = T> + 'd,
+        dma: impl Peripheral<P = impl Channel> + 'd,
+        pin: impl Peripheral<P = impl crate::gpio::Pin>,
+    ) -> Self {
+        into_ref!(dma, pin);
+        pin.gpio().ctrl().write(|w| {
+            w.set_funcsel(pac::io::vals::Gpio0ctrlFuncsel::XIP_SS_N_1 as _);
+        });
+        pin.pad_ctrl().write(|w| {
+            w.set_iso(false);
+        });
+
+        unsafe {
+            ram_helpers::reset_flash();
+        }
+
+        Self {
+            dma: Some(dma.map_into()),
+            phantom: PhantomData,
+        }
+    }
+
     /// Start a background read operation.
     ///
     /// The offset and buffer must be aligned.
@@ -702,7 +726,6 @@ mod ram_helpers {
             ((*ptrs).flash_range_program.unwrap())(addr, data as *const _, len as usize);
         }
         ((*ptrs).flash_flush_cache)();
-        ((*ptrs).flash_enter_cmd_xip)();
     }
 
     #[repr(C)]
@@ -925,6 +948,33 @@ mod ram_helpers {
             out("r10") _,
             clobber_abi("C"),
         );
+    }
+
+    /// Reset the flash to a safe, if very slow state.
+    /// 0x03 reads, slow clock.
+    pub unsafe fn reset_flash() {
+        let mut boot2 = [0u32; 256 / 4];
+        let ptrs = if USE_BOOT2 {
+            #[cfg(feature = "rp2040")]
+            rom_data::memcpy44(&mut boot2 as *mut _, FLASH_BASE, 256);
+            #[cfg(feature = "_rp235x")]
+            core::ptr::copy_nonoverlapping(BOOTROM_BASE as *const u8, boot2.as_mut_ptr() as *mut u8, 256);
+            flash_function_pointers_with_boot2(true, false, &boot2)
+        } else {
+            flash_function_pointers(true, false)
+        };
+
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        reset_flash_inner(&ptrs as *const FlashFunctionPointers);
+    }
+
+    #[inline(never)]
+    #[link_section = ".data.ram_func"]
+    //#[cfg(feature = "_rp235x")]
+    unsafe fn reset_flash_inner(ptrs: *const FlashFunctionPointers) {
+        ((*ptrs).connect_internal_flash)();
+        ((*ptrs).flash_exit_xip)();
     }
 }
 
