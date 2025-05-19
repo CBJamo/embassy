@@ -10,12 +10,16 @@ use embedded_storage::nor_flash::{
     ReadNorFlash,
 };
 
+use crate::block::Partition;
 use crate::dma::{AnyChannel, Channel, Transfer};
 use crate::pac;
 use crate::peripherals::FLASH;
 
 /// Flash base address.
 pub const FLASH_BASE: *const u32 = 0x10000000 as _;
+/// Untranslated and uncached Flash base address.
+#[cfg(feature = "_rp235x")]
+pub const UNTRANSLATED_FLASH_BASE: *const u32 = 0x1C000000 as _;
 
 /// Address for xip setup function set up by the 235x bootrom.
 #[cfg(feature = "_rp235x")]
@@ -138,6 +142,27 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> Flash<'d, T, M, FLASH_SI
         Ok(())
     }
 
+    /// Blocking read from untranslated/flash physical address space.
+    ///
+    /// The offset and buffer must be aligned.
+    ///
+    /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
+    #[cfg(feature = "_rp235x")]
+    pub fn untranslated_blocking_read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Error> {
+        trace!(
+            "Reading from 0x{:x} to 0x{:x}",
+            UNTRANSLATED_FLASH_BASE as u32 + offset,
+            UNTRANSLATED_FLASH_BASE as u32 + offset + bytes.len() as u32
+        );
+        check_read(self, offset, bytes.len())?;
+
+        let flash_data =
+            unsafe { core::slice::from_raw_parts((UNTRANSLATED_FLASH_BASE as u32 + offset) as *const u8, bytes.len()) };
+
+        bytes.copy_from_slice(flash_data);
+        Ok(())
+    }
+
     /// Flash capacity.
     pub fn capacity(&self) -> usize {
         FLASH_SIZE
@@ -145,8 +170,21 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> Flash<'d, T, M, FLASH_SI
 
     /// Blocking erase.
     ///
-    /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
+    /// NOTE: `from` and `to` are offsets from the flash start, NOT absolute addresses.
+    /// NOTE: On the RP2350, `from` and `to` are in the virtual address space.
     pub fn blocking_erase(&mut self, from: u32, to: u32) -> Result<(), Error> {
+        self.blocking_erase_inner(from, to, true)
+    }
+
+    /// Blocking erase.
+    ///
+    /// NOTE: `from` and `to` are offsets from the flash start, NOT absolute addresses.
+    /// NOTE: On the RP2350, `from` and `to` are in the virtual address space.
+    pub fn untranslated_blocking_erase(&mut self, from: u32, to: u32) -> Result<(), Error> {
+        self.blocking_erase_inner(from, to, false)
+    }
+
+    fn blocking_erase_inner(&mut self, from: u32, to: u32, translate: bool) -> Result<(), Error> {
         check_erase(self, from, to)?;
 
         trace!(
@@ -157,7 +195,7 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> Flash<'d, T, M, FLASH_SI
 
         let len = to - from;
 
-        unsafe { in_ram(|| ram_helpers::flash_range_erase(from, len))? };
+        unsafe { in_ram(|| ram_helpers::flash_range_erase(from, len, translate))? };
 
         Ok(())
     }
@@ -167,7 +205,22 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> Flash<'d, T, M, FLASH_SI
     /// The offset and buffer must be aligned.
     ///
     /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
+    /// NOTE: On the RP2350, `offset` is in the virtual address space.
     pub fn blocking_write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Error> {
+        self.blocking_write_inner(offset, bytes, true)
+    }
+
+    /// Blocking write.
+    ///
+    /// The offset and buffer must be aligned.
+    ///
+    /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
+    /// NOTE: On the RP2350, `offset` is in the physical address space.
+    pub fn untranslated_blocking_write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Error> {
+        self.blocking_write_inner(offset, bytes, false)
+    }
+
+    fn blocking_write_inner(&mut self, offset: u32, bytes: &[u8], translate: bool) -> Result<(), Error> {
         check_write(self, offset, bytes.len())?;
 
         trace!("Writing {:?} bytes to 0x{:x}", bytes.len(), FLASH_BASE as u32 + offset);
@@ -187,7 +240,7 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> Flash<'d, T, M, FLASH_SI
 
             let unaligned_offset = offset as usize - start;
 
-            unsafe { in_ram(|| ram_helpers::flash_range_program(unaligned_offset as u32, &pad_buf))? }
+            unsafe { in_ram(|| ram_helpers::flash_range_program(unaligned_offset as u32, &pad_buf, translate))? }
         }
 
         let remaining_len = bytes.len() - start_padding;
@@ -205,12 +258,12 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> Flash<'d, T, M, FLASH_SI
             if bytes.as_ptr() as usize >= 0x2000_0000 {
                 let aligned_data = &bytes[start_padding..end_padding];
 
-                unsafe { in_ram(|| ram_helpers::flash_range_program(aligned_offset as u32, aligned_data))? }
+                unsafe { in_ram(|| ram_helpers::flash_range_program(aligned_offset as u32, aligned_data, translate))? }
             } else {
                 for chunk in bytes[start_padding..end_padding].chunks_exact(PAGE_SIZE) {
                     let mut ram_buf = [0xFF_u8; PAGE_SIZE];
                     ram_buf.copy_from_slice(chunk);
-                    unsafe { in_ram(|| ram_helpers::flash_range_program(aligned_offset as u32, &ram_buf))? }
+                    unsafe { in_ram(|| ram_helpers::flash_range_program(aligned_offset as u32, &ram_buf, translate))? }
                     aligned_offset += PAGE_SIZE;
                 }
             }
@@ -225,7 +278,7 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> Flash<'d, T, M, FLASH_SI
 
             let unaligned_offset = end_offset - (PAGE_SIZE - rem_offset);
 
-            unsafe { in_ram(|| ram_helpers::flash_range_program(unaligned_offset as u32, &pad_buf))? }
+            unsafe { in_ram(|| ram_helpers::flash_range_program(unaligned_offset as u32, &pad_buf, translate))? }
         }
 
         Ok(())
@@ -275,6 +328,7 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
     /// The offset and buffer must be aligned.
     ///
     /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
+    /// NOTE: On the rp2350 `offset` is the address translator virtual address, not the physical flash address.
     pub fn background_read<'a>(
         &'a mut self,
         offset: u32,
@@ -333,6 +387,7 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
     /// The offset and buffer must be aligned.
     ///
     /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
+    /// NOTE: On the rp2350 `offset` is the address translator virtual address, not the physical flash address.
     pub async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Error> {
         use core::mem::MaybeUninit;
 
@@ -441,7 +496,309 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> embedded_storage_async::nor_flash
     }
 }
 
+/// Error type for NVMC operations.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum FlashPartitionError {
+    /// Operation using a location not in flash.
+    OutOfBounds,
+    /// Unaligned operation or using unaligned buffers.
+    Unaligned,
+    /// Accessed from the wrong core.
+    InvalidCore,
+    /// Other error
+    Other,
+    /// Partition not writeable
+    PermissionNotWriteable,
+    /// Partition not readable
+    PermissionNotReadable,
+}
+
+impl From<Error> for FlashPartitionError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::Unaligned => Self::Unaligned,
+            Error::OutOfBounds => Self::OutOfBounds,
+            Error::InvalidCore => Self::InvalidCore,
+            Error::Other => Self::Other,
+        }
+    }
+}
+
+impl From<NorFlashErrorKind> for FlashPartitionError {
+    fn from(e: NorFlashErrorKind) -> Self {
+        match e {
+            NorFlashErrorKind::NotAligned => Self::Unaligned,
+            NorFlashErrorKind::OutOfBounds => Self::OutOfBounds,
+            _ => Self::Other,
+        }
+    }
+}
+
+impl NorFlashError for FlashPartitionError {
+    fn kind(&self) -> NorFlashErrorKind {
+        match self {
+            Self::OutOfBounds => NorFlashErrorKind::OutOfBounds,
+            Self::Unaligned => NorFlashErrorKind::NotAligned,
+            _ => NorFlashErrorKind::Other,
+        }
+    }
+}
+
+/// Access the flash addressed and permissioned by a partition.
+pub struct FlashPartition<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> {
+    flash: Flash<'d, T, M, FLASH_SIZE>,
+    partition: Partition,
+}
+
+impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> FlashPartition<'d, T, M, FLASH_SIZE> {
+    /// Create a new async PartitionFlash
+    pub fn new(flash: Flash<'d, T, M, FLASH_SIZE>, partition: Partition) -> Self {
+        Self { flash, partition }
+    }
+
+    /// Get the physical address of this partition.
+    pub fn partition(&self) -> Partition {
+        self.partition.clone()
+    }
+}
+
+impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> ErrorType for FlashPartition<'d, T, M, FLASH_SIZE> {
+    type Error = FlashPartitionError;
+}
+
+impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> ReadNorFlash for FlashPartition<'d, T, M, FLASH_SIZE> {
+    const READ_SIZE: usize = READ_SIZE;
+
+    fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        // TODO: Handle nonsecure
+        if !self.partition.has_permission(crate::block::Permission::SecureRead) {
+            return Err(FlashPartitionError::PermissionNotReadable);
+        }
+
+        let (start, _) = self.partition.get_first_last_bytes();
+
+        if bytes.len() > self.capacity() {
+            return Err(FlashPartitionError::OutOfBounds);
+        }
+
+        self.flash.untranslated_blocking_read(offset + start, bytes)?;
+
+        Ok(())
+    }
+
+    fn capacity(&self) -> usize {
+        let (start, end) = self.partition.get_first_last_bytes();
+
+        (end - start) as usize
+    }
+}
+
+impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> MultiwriteNorFlash for FlashPartition<'d, T, M, FLASH_SIZE> {}
+
+impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> NorFlash for FlashPartition<'d, T, M, FLASH_SIZE> {
+    const WRITE_SIZE: usize = WRITE_SIZE;
+
+    const ERASE_SIZE: usize = ERASE_SIZE;
+
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        // TODO: Handle nonsecure
+        if !self.partition.has_permission(crate::block::Permission::SecureWrite) {
+            return Err(FlashPartitionError::PermissionNotWriteable);
+        }
+
+        let (start, end) = self.partition.get_first_last_bytes();
+
+        if to > end {
+            return Err(FlashPartitionError::OutOfBounds);
+        }
+
+        self.flash.untranslated_blocking_erase(from + start, to + start)?;
+
+        Ok(())
+    }
+
+    fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        // TODO: Handle nonsecure
+        if !self.partition.has_permission(crate::block::Permission::SecureWrite) {
+            return Err(FlashPartitionError::PermissionNotWriteable);
+        }
+
+        let (start, _) = self.partition.get_first_last_bytes();
+
+        if bytes.len() > self.capacity() {
+            return Err(FlashPartitionError::OutOfBounds);
+        }
+
+        self.flash.untranslated_blocking_write(offset + start, bytes)?;
+
+        Ok(())
+    }
+}
+
 #[allow(dead_code)]
+mod ram_helpers {
+    use super::*;
+    use crate::rom_data;
+
+    const FLASH_OP_WRITE_BIT: u32 = 1 << 16;
+    const FLASH_OP_SECURE_BIT: u32 = 1 << 8;
+
+    #[repr(C)]
+    struct FlashFunctionPointers<'a> {
+        connect_internal_flash: unsafe extern "C" fn() -> (),
+        flash_exit_xip: unsafe extern "C" fn() -> (),
+        flash_op: unsafe extern "C" fn(flags: u32, addr: u32, size_bytes: u32, buf: *mut u8) -> i32,
+        flash_flush_cache: unsafe extern "C" fn() -> (),
+        flash_enter_cmd_xip: unsafe extern "C" fn() -> (),
+        phantom: PhantomData<&'a ()>,
+    }
+
+    #[allow(unused)]
+    fn flash_function_pointers() -> FlashFunctionPointers<'static> {
+        FlashFunctionPointers {
+            connect_internal_flash: rom_data::connect_internal_flash::ptr(),
+            flash_exit_xip: rom_data::flash_exit_xip::ptr(),
+            flash_op: rom_data::flash_op::ptr(),
+            flash_flush_cache: rom_data::flash_flush_cache::ptr(),
+            flash_enter_cmd_xip: rom_data::flash_enter_cmd_xip::ptr(),
+            phantom: PhantomData,
+        }
+    }
+
+    #[allow(unused)]
+    /// # Safety
+    ///
+    /// `boot2` must contain a valid 2nd stage boot loader which can be called to re-initialize XIP mode
+    unsafe fn flash_function_pointers_with_boot2(boot2: &[u32; 64]) -> FlashFunctionPointers {
+        let boot2_fn_ptr = (boot2 as *const u32 as *const u8).offset(1);
+        let boot2_fn: unsafe extern "C" fn() -> () = core::mem::transmute(boot2_fn_ptr);
+        FlashFunctionPointers {
+            connect_internal_flash: rom_data::connect_internal_flash::ptr(),
+            flash_exit_xip: rom_data::flash_exit_xip::ptr(),
+            flash_op: rom_data::flash_op::ptr(),
+            flash_flush_cache: rom_data::flash_flush_cache::ptr(),
+            flash_enter_cmd_xip: boot2_fn,
+            phantom: PhantomData,
+        }
+    }
+
+    /// Erase a flash range starting at `addr` with length `len`.
+    ///
+    /// `addr` and `len` must be multiples of 4096
+    ///
+    /// If `USE_BOOT2` is `true`, a copy of the 2nd stage boot loader
+    /// is used to re-initialize the XIP engine after flashing.
+    ///
+    /// # Safety
+    ///
+    /// Nothing must access flash while this is running.
+    /// Usually this means:
+    ///   - interrupts must be disabled
+    ///   - 2nd core must be running code from RAM or ROM with interrupts disabled
+    ///   - DMA must not access flash memory
+    ///
+    /// `addr` and `len` parameters must be valid and are not checked.
+    pub unsafe fn flash_range_erase(addr: u32, len: u32, translate: bool) {
+        let mut boot2 = [0u32; 256 / 4];
+        let ptrs = if USE_BOOT2 {
+            core::ptr::copy_nonoverlapping(BOOTRAM_BASE as *const u8, boot2.as_mut_ptr() as *mut u8, 256);
+            flash_function_pointers_with_boot2(&boot2)
+        } else {
+            flash_function_pointers()
+        };
+
+        let flags = translate as u32 | FLASH_OP_SECURE_BIT;
+
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        flash_op(
+            flags,
+            FLASH_BASE as u32 + addr,
+            len,
+            None,
+            &ptrs as *const FlashFunctionPointers,
+        );
+    }
+
+    /// Write a flash range starting at `addr` with data `data`.
+    ///
+    /// `addr` and `data.len()` must be multiples of 256
+    ///
+    /// If `USE_BOOT2` is `true`, a copy of the 2nd stage boot loader
+    /// is used to re-initialize the XIP engine after flashing.
+    ///
+    /// # Safety
+    ///
+    /// Nothing must access flash while this is running.
+    /// Usually this means:
+    ///   - interrupts must be disabled
+    ///   - 2nd core must be running code from RAM or ROM with interrupts disabled
+    ///   - DMA must not access flash memory
+    ///
+    /// `addr` and `len` parameters must be valid and are not checked.
+    pub unsafe fn flash_range_program(addr: u32, data: &[u8], translate: bool) {
+        let mut boot2 = [0u32; 256 / 4];
+        let ptrs = if USE_BOOT2 {
+            core::ptr::copy_nonoverlapping(BOOTRAM_BASE as *const u8, boot2.as_mut_ptr() as *mut u8, 256);
+            flash_function_pointers_with_boot2(&boot2)
+        } else {
+            flash_function_pointers()
+        };
+
+        // Set translate in flags;
+        let flags = translate as u32 | FLASH_OP_WRITE_BIT | FLASH_OP_SECURE_BIT;
+
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        flash_op(
+            flags,
+            FLASH_BASE as u32 + addr,
+            data.len() as u32,
+            Some(data),
+            &ptrs as *const FlashFunctionPointers,
+        );
+    }
+
+    /// # Safety
+    ///
+    /// Nothing must access flash while this is running.
+    /// Usually this means:
+    ///   - interrupts must be disabled
+    ///   - 2nd core must be running code from RAM or ROM with interrupts disabled
+    ///   - DMA must not access flash memory
+    /// Length of data must be a multiple of 4096
+    /// addr must be aligned to 4096
+    #[inline(never)]
+    #[link_section = ".data.ram_func"]
+    unsafe fn flash_op(
+        flags: u32,
+        addr: u32,
+        len: u32,
+        data: Option<&[u8]>,
+        ptrs: *const FlashFunctionPointers,
+    ) -> i32 {
+        let data = data.map(|d| d.as_ptr()).unwrap_or(core::ptr::null());
+        ((*ptrs).connect_internal_flash)();
+        ((*ptrs).flash_exit_xip)();
+        let ret = ((*ptrs).flash_op)(flags, addr, len, data as *mut u8);
+        ((*ptrs).flash_flush_cache)();
+        ((*ptrs).flash_enter_cmd_xip)();
+
+        ret
+    }
+
+    #[repr(C)]
+    struct FlashCommand {
+        cmd_addr: *const u8,
+        dummy_len: u32,
+        data: *mut u8,
+        data_len: u32,
+    }
+}
+
+#[allow(dead_code)]
+#[cfg(feature = "rp2040")]
 mod ram_helpers {
     use super::*;
     use crate::rom_data;
@@ -524,13 +881,10 @@ mod ram_helpers {
     ///   - DMA must not access flash memory
     ///
     /// `addr` and `len` parameters must be valid and are not checked.
-    pub unsafe fn flash_range_erase(addr: u32, len: u32) {
+    pub unsafe fn flash_range_erase(addr: u32, len: u32, _translate: bool) {
         let mut boot2 = [0u32; 256 / 4];
         let ptrs = if USE_BOOT2 {
-            #[cfg(feature = "rp2040")]
             rom_data::memcpy44(&mut boot2 as *mut _, FLASH_BASE, 256);
-            #[cfg(feature = "_rp235x")]
-            core::ptr::copy_nonoverlapping(BOOTRAM_BASE as *const u8, boot2.as_mut_ptr() as *mut u8, 256);
             flash_function_pointers_with_boot2(true, false, &boot2)
         } else {
             flash_function_pointers(true, false)
@@ -557,13 +911,10 @@ mod ram_helpers {
     ///   - DMA must not access flash memory
     ///
     /// `addr` and `len` parameters must be valid and are not checked.
-    pub unsafe fn flash_range_erase_and_program(addr: u32, data: &[u8]) {
+    pub unsafe fn flash_range_erase_and_program(addr: u32, data: &[u8], _translate: bool) {
         let mut boot2 = [0u32; 256 / 4];
         let ptrs = if USE_BOOT2 {
-            #[cfg(feature = "rp2040")]
             rom_data::memcpy44(&mut boot2 as *mut _, FLASH_BASE, 256);
-            #[cfg(feature = "_rp235x")]
-            core::ptr::copy_nonoverlapping(BOOTRAM_BASE as *const u8, (boot2).as_mut_ptr() as *mut u8, 256);
             flash_function_pointers_with_boot2(true, true, &boot2)
         } else {
             flash_function_pointers(true, true)
@@ -595,13 +946,10 @@ mod ram_helpers {
     ///   - DMA must not access flash memory
     ///
     /// `addr` and `len` parameters must be valid and are not checked.
-    pub unsafe fn flash_range_program(addr: u32, data: &[u8]) {
+    pub unsafe fn flash_range_program(addr: u32, data: &[u8], _translate: bool) {
         let mut boot2 = [0u32; 256 / 4];
         let ptrs = if USE_BOOT2 {
-            #[cfg(feature = "rp2040")]
             rom_data::memcpy44(&mut boot2 as *mut _, FLASH_BASE, 256);
-            #[cfg(feature = "_rp235x")]
-            core::ptr::copy_nonoverlapping(BOOTRAM_BASE as *const u8, boot2.as_mut_ptr() as *mut u8, 256);
             flash_function_pointers_with_boot2(false, true, &boot2)
         } else {
             flash_function_pointers(false, true)
@@ -628,7 +976,6 @@ mod ram_helpers {
     /// addr must be aligned to 4096
     #[inline(never)]
     #[link_section = ".data.ram_func"]
-    #[cfg(feature = "rp2040")]
     unsafe fn write_flash_inner(addr: u32, len: u32, data: Option<&[u8]>, ptrs: *const FlashFunctionPointers) {
         #[cfg(target_arch = "arm")]
         core::arch::asm!(
@@ -682,32 +1029,6 @@ mod ram_helpers {
         );
     }
 
-    /// # Safety
-    ///
-    /// Nothing must access flash while this is running.
-    /// Usually this means:
-    ///   - interrupts must be disabled
-    ///   - 2nd core must be running code from RAM or ROM with interrupts disabled
-    ///   - DMA must not access flash memory
-    /// Length of data must be a multiple of 4096
-    /// addr must be aligned to 4096
-    #[inline(never)]
-    #[link_section = ".data.ram_func"]
-    #[cfg(feature = "_rp235x")]
-    unsafe fn write_flash_inner(addr: u32, len: u32, data: Option<&[u8]>, ptrs: *const FlashFunctionPointers) {
-        let data = data.map(|d| d.as_ptr()).unwrap_or(core::ptr::null());
-        ((*ptrs).connect_internal_flash)();
-        ((*ptrs).flash_exit_xip)();
-        if (*ptrs).flash_range_erase.is_some() {
-            ((*ptrs).flash_range_erase.unwrap())(addr, len as usize, 1 << 31, 0);
-        }
-        if (*ptrs).flash_range_program.is_some() {
-            ((*ptrs).flash_range_program.unwrap())(addr, data as *const _, len as usize);
-        }
-        ((*ptrs).flash_flush_cache)();
-        ((*ptrs).flash_enter_cmd_xip)();
-    }
-
     #[repr(C)]
     struct FlashCommand {
         cmd_addr: *const u8,
@@ -741,7 +1062,6 @@ mod ram_helpers {
     ///   - DMA must not access flash memory
     ///
     /// Credit: taken from `rp2040-flash` (also licensed Apache+MIT)
-    #[cfg(feature = "rp2040")]
     pub unsafe fn flash_unique_id(out: &mut [u8]) {
         let mut boot2 = [0u32; 256 / 4];
         let ptrs = if USE_BOOT2 {
@@ -771,7 +1091,6 @@ mod ram_helpers {
     ///   - DMA must not access flash memory
     ///
     /// Credit: taken from `rp2040-flash` (also licensed Apache+MIT)
-    #[cfg(feature = "rp2040")]
     pub unsafe fn flash_jedec_id() -> u32 {
         let mut boot2 = [0u32; 256 / 4];
         let ptrs = if USE_BOOT2 {
@@ -788,7 +1107,6 @@ mod ram_helpers {
         u32::from_be_bytes(id)
     }
 
-    #[cfg(feature = "rp2040")]
     unsafe fn read_flash(cmd_addr: &[u8], dummy_len: u32, out: &mut [u8], ptrs: *const FlashFunctionPointers) {
         read_flash_inner(
             FlashCommand {
@@ -812,7 +1130,6 @@ mod ram_helpers {
     /// Credit: taken from `rp2040-flash` (also licensed Apache+MIT)
     #[inline(never)]
     #[link_section = ".data.ram_func"]
-    #[cfg(feature = "rp2040")]
     unsafe fn read_flash_inner(cmd: FlashCommand, ptrs: *const FlashFunctionPointers) {
         #[cfg(target_arch = "arm")]
         core::arch::asm!(
