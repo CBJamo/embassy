@@ -15,6 +15,7 @@ use crate::{Peri, pac};
 
 /// The reason for a system reset from the watchdog.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ResetReason {
     /// The reset was forced.
     Forced,
@@ -73,8 +74,13 @@ impl Watchdog {
     // (everything except ROSC, XOSC)
     fn configure_wdog_reset_triggers(&self) {
         let psm = pac::PSM;
+        #[cfg(feature = "rp2040")]
         psm.wdsel().write_value(pac::psm::regs::Wdsel(
             0x0001ffff & !(0x01 << 0usize) & !(0x01 << 1usize),
+        ));
+        #[cfg(feature = "_rp235x")]
+        psm.wdsel().write_value(pac::psm::regs::Wdsel(
+            0x00ff_ffff & !(0x01 << 2usize) & !(0x01 << 3usize),
         ));
     }
 

@@ -186,6 +186,7 @@ pub fn usb_dfu<'d, D: Driver<'d>, H: Handler>(
     max_write_size: usize,
     func_modifier: impl Fn(&mut FunctionBuilder<'_, 'd, D>),
 ) {
+    let max_write_size = max_write_size.min(builder.control_buf_len());
     let mut func = builder.function(0x00, 0x00, 0x00);
 
     // Here we give users the opportunity to add their own function level MSOS headers for instance.
