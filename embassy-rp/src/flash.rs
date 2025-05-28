@@ -5,6 +5,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use embassy_hal_internal::{Peri, PeripheralType};
+use embassy_sync::{blocking_mutex::raw::RawMutex, mutex::Mutex};
 use embedded_storage::nor_flash::{
     check_erase, check_read, check_write, ErrorType, MultiwriteNorFlash, NorFlash, NorFlashError, NorFlashErrorKind,
     ReadNorFlash,
@@ -142,7 +143,7 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> Flash<'d, T, M, FLASH_SI
         Ok(())
     }
 
-    /// Blocking read from untranslated/flash physical address space.
+    /// Blocking read from untranslated address space. Untranslated reads are not cached by XIP.
     ///
     /// The offset and buffer must be aligned.
     ///
@@ -161,6 +162,16 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> Flash<'d, T, M, FLASH_SI
 
         bytes.copy_from_slice(flash_data);
         Ok(())
+    }
+
+    /// Blocking read from untranslated address space.
+    ///
+    /// The offset and buffer must be aligned.
+    ///
+    /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
+    #[cfg(feature = "rp2040")]
+    pub fn untranslated_blocking_read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Error> {
+        self.blocking_read(offset, bytes)
     }
 
     /// Flash capacity.
@@ -187,10 +198,25 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> Flash<'d, T, M, FLASH_SI
     fn blocking_erase_inner(&mut self, from: u32, to: u32, translate: bool) -> Result<(), Error> {
         check_erase(self, from, to)?;
 
+        #[cfg(feature = "rp2040")]
         trace!(
             "Erasing from 0x{:x} to 0x{:x}",
             FLASH_BASE as u32 + from,
             FLASH_BASE as u32 + to
+        );
+        #[cfg(feature = "_rp235x")]
+        trace!(
+            "Erasing from 0x{:x} to 0x{:x}",
+            if translate {
+                FLASH_BASE as u32
+            } else {
+                UNTRANSLATED_FLASH_BASE as u32
+            } + from,
+            if translate {
+                FLASH_BASE as u32
+            } else {
+                UNTRANSLATED_FLASH_BASE as u32
+            } + to
         );
 
         let len = to - from;
@@ -223,7 +249,18 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> Flash<'d, T, M, FLASH_SI
     fn blocking_write_inner(&mut self, offset: u32, bytes: &[u8], translate: bool) -> Result<(), Error> {
         check_write(self, offset, bytes.len())?;
 
+        #[cfg(feature = "rp2040")]
         trace!("Writing {:?} bytes to 0x{:x}", bytes.len(), FLASH_BASE as u32 + offset);
+        #[cfg(feature = "_rp235x")]
+        trace!(
+            "Writing {:?} bytes to 0x{:x}",
+            bytes.len(),
+            if translate {
+                FLASH_BASE as u32
+            } else {
+                UNTRANSLATED_FLASH_BASE as u32
+            } + offset
+        );
 
         let end_offset = offset as usize + bytes.len();
 
@@ -334,10 +371,38 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
         offset: u32,
         data: &'a mut [u32],
     ) -> Result<BackgroundRead<'a, 'd, T, FLASH_SIZE>, Error> {
+        self.background_read_inner(offset, data, false)
+    }
+
+    /// Start an untranslated background read operation. Untranslated reads are not cached by XIP.
+    ///
+    /// The offset and buffer must be aligned.
+    ///
+    /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
+    pub fn untranslated_background_read<'a>(
+        &'a mut self,
+        offset: u32,
+        data: &'a mut [u32],
+    ) -> Result<BackgroundRead<'a, 'd, T, FLASH_SIZE>, Error> {
+        self.background_read_inner(offset, data, true)
+    }
+
+    fn background_read_inner<'a>(
+        &'a mut self,
+        offset: u32,
+        data: &'a mut [u32],
+        translate: bool,
+    ) -> Result<BackgroundRead<'a, 'd, T, FLASH_SIZE>, Error> {
+        let base = if cfg!(feature = "_rp235x") && translate {
+            UNTRANSLATED_FLASH_BASE
+        } else {
+            FLASH_BASE
+        };
+
         trace!(
             "Reading in background from 0x{:x} to 0x{:x}",
-            FLASH_BASE as u32 + offset,
-            FLASH_BASE as u32 + offset + (data.len() * 4) as u32
+            base as u32 + offset,
+            base as u32 + offset + (data.len() * 4) as u32
         );
         // Can't use check_read because we need to enforce 4-byte alignment
         let offset = offset as usize;
@@ -355,7 +420,7 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
 
         pac::XIP_CTRL
             .stream_addr()
-            .write_value(pac::xip_ctrl::regs::StreamAddr(FLASH_BASE as u32 + offset as u32));
+            .write_value(pac::xip_ctrl::regs::StreamAddr(base as u32 + offset as u32));
         pac::XIP_CTRL
             .stream_ctr()
             .write_value(pac::xip_ctrl::regs::StreamCtr(data.len() as u32));
@@ -389,6 +454,20 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
     /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
     /// NOTE: On the rp2350 `offset` is the address translator virtual address, not the physical flash address.
     pub async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Error> {
+        self.read_inner(offset, bytes, false).await
+    }
+
+    /// Untranslated Async read. Untranslated reads are not cached by XIP.
+    ///
+    /// The offset and buffer must be aligned.
+    ///
+    /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
+    /// NOTE: On the rp2350 `offset` is the address translator virtual address, not the physical flash address.
+    pub async fn untranslated_read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Error> {
+        self.read_inner(offset, bytes, true).await
+    }
+
+    async fn read_inner(&mut self, offset: u32, bytes: &mut [u8], translate: bool) -> Result<(), Error> {
         use core::mem::MaybeUninit;
 
         // Checked early to simplify address validity checks
@@ -401,7 +480,7 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
             // Safety: alignment and size have been checked for compatibility
             let buf: &mut [u32] =
                 unsafe { core::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut u32, bytes.len() / 4) };
-            self.background_read(offset, buf)?.await;
+            self.background_read_inner(offset, buf, translate)?.await;
             return Ok(());
         }
 
@@ -546,31 +625,36 @@ impl NorFlashError for FlashPartitionError {
 }
 
 /// Access the flash addressed and permissioned by a partition.
-pub struct FlashPartition<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> {
-    flash: Flash<'d, T, M, FLASH_SIZE>,
+/// Reads and writes to FlashPartitions are not cached by XIP.
+pub struct FlashPartition<'d, X: RawMutex, T: Instance, const FLASH_SIZE: usize> {
+    flash: &'d Mutex<X, Flash<'d, T, Async, FLASH_SIZE>>,
     partition: Partition,
 }
 
-impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> FlashPartition<'d, T, M, FLASH_SIZE> {
+impl<'d, X: RawMutex, T: Instance, const FLASH_SIZE: usize> FlashPartition<'d, X, T, FLASH_SIZE> {
     /// Create a new async PartitionFlash
-    pub fn new(flash: Flash<'d, T, M, FLASH_SIZE>, partition: Partition) -> Self {
+    pub fn new(flash: &'d Mutex<X, Flash<'d, T, Async, FLASH_SIZE>>, partition: Partition) -> Self {
         Self { flash, partition }
     }
 
-    /// Get the physical address of this partition.
+    /// Get the `Partition` for this `FlashPartition`
     pub fn partition(&self) -> Partition {
         self.partition.clone()
     }
-}
 
-impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> ErrorType for FlashPartition<'d, T, M, FLASH_SIZE> {
-    type Error = FlashPartitionError;
-}
+    /// Get size in bytes of this partition.
+    pub fn capacity(&self) -> usize {
+        let (start, end) = self.partition.get_first_last_bytes();
 
-impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> ReadNorFlash for FlashPartition<'d, T, M, FLASH_SIZE> {
-    const READ_SIZE: usize = READ_SIZE;
+        (end - start + 1) as usize
+    }
 
-    fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+    /// Read from the flash partition.
+    ///
+    /// The offset and buffer must be aligned.
+    ///
+    /// NOTE: `offset` is an offset from the partition start, NOT an absolute address.
+    pub async fn read(&self, offset: u32, bytes: &mut [u8]) -> Result<(), FlashPartitionError> {
         // TODO: Handle nonsecure
         if !self.partition.has_permission(crate::block::Permission::SecureRead) {
             return Err(FlashPartitionError::PermissionNotReadable);
@@ -578,47 +662,21 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> ReadNorFlash for FlashPa
 
         let (start, _) = self.partition.get_first_last_bytes();
 
-        if bytes.len() > self.capacity() {
+        if offset as usize + bytes.len() > self.capacity() {
             return Err(FlashPartitionError::OutOfBounds);
         }
 
-        self.flash.untranslated_blocking_read(offset + start, bytes)?;
+        let mut flash = self.flash.lock().await;
+        flash.untranslated_read(start + offset, bytes).await?;
 
         Ok(())
     }
 
-    fn capacity(&self) -> usize {
-        let (start, end) = self.partition.get_first_last_bytes();
-
-        (end - start) as usize
-    }
-}
-
-impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> MultiwriteNorFlash for FlashPartition<'d, T, M, FLASH_SIZE> {}
-
-impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> NorFlash for FlashPartition<'d, T, M, FLASH_SIZE> {
-    const WRITE_SIZE: usize = WRITE_SIZE;
-
-    const ERASE_SIZE: usize = ERASE_SIZE;
-
-    fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
-        // TODO: Handle nonsecure
-        if !self.partition.has_permission(crate::block::Permission::SecureWrite) {
-            return Err(FlashPartitionError::PermissionNotWriteable);
-        }
-
-        let (start, end) = self.partition.get_first_last_bytes();
-
-        if to > end {
-            return Err(FlashPartitionError::OutOfBounds);
-        }
-
-        self.flash.untranslated_blocking_erase(from + start, to + start)?;
-
-        Ok(())
-    }
-
-    fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+    /// Erase from the flash partition. The actual erase is blocking, this function is async for the
+    /// mutex.
+    ///
+    /// NOTE: `from` and `to` are offsets from the partition start, NOT an absolute address.
+    pub async fn erase(&self, from: u32, to: u32) -> Result<(), FlashPartitionError> {
         // TODO: Handle nonsecure
         if !self.partition.has_permission(crate::block::Permission::SecureWrite) {
             return Err(FlashPartitionError::PermissionNotWriteable);
@@ -626,17 +684,80 @@ impl<'d, T: Instance, M: Mode, const FLASH_SIZE: usize> NorFlash for FlashPartit
 
         let (start, _) = self.partition.get_first_last_bytes();
 
-        if bytes.len() > self.capacity() {
+        if from > self.capacity() as u32 || to > self.capacity() as u32 {
             return Err(FlashPartitionError::OutOfBounds);
         }
 
-        self.flash.untranslated_blocking_write(offset + start, bytes)?;
+        let mut flash = self.flash.lock().await;
+        flash.untranslated_blocking_erase(start + from, start + to)?;
+
+        Ok(())
+    }
+
+    /// Write to the flash partition. The actual write is blocking, this function is async for the
+    /// mutex.
+    ///
+    /// NOTE: `offset` is an offset from the partition start, NOT an absolute address.
+    pub async fn write(&self, offset: u32, bytes: &[u8]) -> Result<(), FlashPartitionError> {
+        // TODO: Handle nonsecure
+        if !self.partition.has_permission(crate::block::Permission::SecureWrite) {
+            return Err(FlashPartitionError::PermissionNotWriteable);
+        }
+
+        let (start, _) = self.partition.get_first_last_bytes();
+
+        if offset as usize + bytes.len() > self.capacity() {
+            return Err(FlashPartitionError::OutOfBounds);
+        }
+
+        let mut flash = self.flash.lock().await;
+        flash.untranslated_blocking_write(start + offset, bytes)?;
 
         Ok(())
     }
 }
 
+impl<'d, X: RawMutex, T: Instance, const FLASH_SIZE: usize> ErrorType for FlashPartition<'d, X, T, FLASH_SIZE> {
+    type Error = FlashPartitionError;
+}
+
+impl<'d, X: RawMutex, T: Instance, const FLASH_SIZE: usize> embedded_storage_async::nor_flash::ReadNorFlash
+    for FlashPartition<'d, X, T, FLASH_SIZE>
+{
+    const READ_SIZE: usize = READ_SIZE;
+
+    async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        FlashPartition::read(self, offset, bytes).await
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity()
+    }
+}
+
+impl<'d, X: RawMutex, T: Instance, const FLASH_SIZE: usize> embedded_storage_async::nor_flash::MultiwriteNorFlash
+    for FlashPartition<'d, X, T, FLASH_SIZE>
+{
+}
+
+impl<'d, X: RawMutex, T: Instance, const FLASH_SIZE: usize> embedded_storage_async::nor_flash::NorFlash
+    for FlashPartition<'d, X, T, FLASH_SIZE>
+{
+    const WRITE_SIZE: usize = WRITE_SIZE;
+
+    const ERASE_SIZE: usize = ERASE_SIZE;
+
+    async fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        FlashPartition::erase(self, from, to).await
+    }
+
+    async fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        FlashPartition::write(self, offset, bytes).await
+    }
+}
+
 #[allow(dead_code)]
+#[cfg(feature = "_rp235x")]
 mod ram_helpers {
     use super::*;
     use crate::rom_data;
@@ -797,7 +918,7 @@ mod ram_helpers {
     }
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, unused_variables)]
 #[cfg(feature = "rp2040")]
 mod ram_helpers {
     use super::*;
