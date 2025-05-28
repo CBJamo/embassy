@@ -19,7 +19,6 @@ mod critical_section_impl;
 mod intrinsics;
 
 pub mod adc;
-#[cfg(feature = "_rp235x")]
 pub mod block;
 #[cfg(feature = "rp2040")]
 pub mod bootsel;
