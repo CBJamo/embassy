@@ -54,6 +54,9 @@ pub mod raw;
 mod spawner;
 pub use spawner::*;
 
+mod metadata;
+pub use metadata::*;
+
 /// Implementation details for embassy macros.
 /// Do not use. Used for macros and HALs only. Not covered by semver guarantees.
 #[doc(hidden)]
@@ -216,7 +219,7 @@ pub mod _export {
     );
 
     #[allow(dead_code)]
-    trait HasOutput {
+    pub trait HasOutput {
         type Output;
     }
 
@@ -225,7 +228,7 @@ pub mod _export {
     }
 
     #[allow(dead_code)]
-    type Never = <fn() -> ! as HasOutput>::Output;
+    pub type Never = <fn() -> ! as HasOutput>::Output;
 }
 
 /// Implementation details for embassy macros.
@@ -242,7 +245,7 @@ pub mod _export {
     impl TaskReturnValue for Never {}
 
     #[allow(dead_code)]
-    trait HasOutput {
+    pub trait HasOutput {
         type Output;
     }
 
@@ -251,5 +254,5 @@ pub mod _export {
     }
 
     #[allow(dead_code)]
-    type Never = <fn() -> ! as HasOutput>::Output;
+    pub type Never = <fn() -> ! as HasOutput>::Output;
 }
