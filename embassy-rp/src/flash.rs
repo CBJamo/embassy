@@ -371,38 +371,10 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
         offset: u32,
         data: &'a mut [u32],
     ) -> Result<BackgroundRead<'a, 'd, T, FLASH_SIZE>, Error> {
-        self.background_read_inner(offset, data, false)
-    }
-
-    /// Start an untranslated background read operation. Untranslated reads are not cached by XIP.
-    ///
-    /// The offset and buffer must be aligned.
-    ///
-    /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
-    pub fn untranslated_background_read<'a>(
-        &'a mut self,
-        offset: u32,
-        data: &'a mut [u32],
-    ) -> Result<BackgroundRead<'a, 'd, T, FLASH_SIZE>, Error> {
-        self.background_read_inner(offset, data, true)
-    }
-
-    fn background_read_inner<'a>(
-        &'a mut self,
-        offset: u32,
-        data: &'a mut [u32],
-        translate: bool,
-    ) -> Result<BackgroundRead<'a, 'd, T, FLASH_SIZE>, Error> {
-        let base = if cfg!(feature = "_rp235x") && translate {
-            UNTRANSLATED_FLASH_BASE
-        } else {
-            FLASH_BASE
-        };
-
         trace!(
             "Reading in background from 0x{:x} to 0x{:x}",
-            base as u32 + offset,
-            base as u32 + offset + (data.len() * 4) as u32
+            FLASH_BASE as u32 + offset,
+            FLASH_BASE as u32 + offset + (data.len() * 4) as u32
         );
         // Can't use check_read because we need to enforce 4-byte alignment
         let offset = offset as usize;
@@ -420,7 +392,7 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
 
         pac::XIP_CTRL
             .stream_addr()
-            .write_value(pac::xip_ctrl::regs::StreamAddr(base as u32 + offset as u32));
+            .write_value(pac::xip_ctrl::regs::StreamAddr(FLASH_BASE as u32 + offset as u32));
         pac::XIP_CTRL
             .stream_ctr()
             .write_value(pac::xip_ctrl::regs::StreamCtr(data.len() as u32));
@@ -454,20 +426,6 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
     /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
     /// NOTE: On the rp2350 `offset` is the address translator virtual address, not the physical flash address.
     pub async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Error> {
-        self.read_inner(offset, bytes, false).await
-    }
-
-    /// Untranslated Async read. Untranslated reads are not cached by XIP.
-    ///
-    /// The offset and buffer must be aligned.
-    ///
-    /// NOTE: `offset` is an offset from the flash start, NOT an absolute address.
-    /// NOTE: On the rp2350 `offset` is the address translator virtual address, not the physical flash address.
-    pub async fn untranslated_read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Error> {
-        self.read_inner(offset, bytes, true).await
-    }
-
-    async fn read_inner(&mut self, offset: u32, bytes: &mut [u8], translate: bool) -> Result<(), Error> {
         use core::mem::MaybeUninit;
 
         // Checked early to simplify address validity checks
@@ -480,7 +438,7 @@ impl<'d, T: Instance, const FLASH_SIZE: usize> Flash<'d, T, Async, FLASH_SIZE> {
             // Safety: alignment and size have been checked for compatibility
             let buf: &mut [u32] =
                 unsafe { core::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut u32, bytes.len() / 4) };
-            self.background_read_inner(offset, buf, translate)?.await;
+            self.background_read(offset, buf)?.await;
             return Ok(());
         }
 
@@ -667,7 +625,7 @@ impl<'d, X: RawMutex, T: Instance, const FLASH_SIZE: usize> FlashPartition<'d, X
         }
 
         let mut flash = self.flash.lock().await;
-        flash.untranslated_read(start + offset, bytes).await?;
+        flash.untranslated_blocking_read(start + offset, bytes)?;
 
         Ok(())
     }
@@ -791,7 +749,7 @@ mod ram_helpers {
     /// # Safety
     ///
     /// `boot2` must contain a valid 2nd stage boot loader which can be called to re-initialize XIP mode
-    unsafe fn flash_function_pointers_with_boot2(boot2: &[u32; 64]) -> FlashFunctionPointers {
+    unsafe fn flash_function_pointers_with_boot2(boot2: &[u32; 64]) -> FlashFunctionPointers<'_> {
         let boot2_fn_ptr = (boot2 as *const u32 as *const u8).offset(1);
         let boot2_fn: unsafe extern "C" fn() -> () = core::mem::transmute(boot2_fn_ptr);
         FlashFunctionPointers {
