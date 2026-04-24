@@ -9,6 +9,8 @@
 // Credit: Taken from https://github.com/thejpster/rp-hal-rp2350-public (also licensed Apache 2.0 + MIT).
 // Copyright (c) rp-rs organization
 
+use crate::flash::{Error as FlashError, Flash, Instance, Mode};
+
 // These all have a 1 byte size
 
 /// An item ID for encoding a Vector Table address
@@ -108,6 +110,9 @@ const BLOCK_MARKER_END: u32 = 0xab123579;
 /// An Image Definition has one item in it - an [`ITEM_1BS_IMAGE_TYPE`]
 pub type ImageDef = Block<1>;
 
+/// An block with an ImageDef and a Version
+pub type ImageDefVersion = Block<3>;
+
 /// A Block as understood by the Boot ROM.
 ///
 /// This could be an Image Definition, or a Partition Table, or maybe some other
@@ -115,8 +120,9 @@ pub type ImageDef = Block<1>;
 ///
 /// It contains within the special start and end markers the Boot ROM is looking
 /// for.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 #[repr(C)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Block<const N: usize> {
     marker_start: u32,
     items: [u32; N],
@@ -187,7 +193,7 @@ impl ImageDef {
     /// Construct a new IMAGE_DEF Block, for an EXE with the given security and
     /// architecture.
     pub const fn arch_exe(security: Security, architecture: Architecture) -> Self {
-        Self::new([item_image_type_exe(security, architecture)])
+        Self::new([item_image_type_exe(security, architecture, false)])
     }
 
     /// Construct a new IMAGE_DEF Block, for an EXE with the given security.
@@ -219,11 +225,62 @@ impl ImageDef {
     }
 }
 
+impl ImageDefVersion {
+    /// Construct a new IMAGE_DEF Block, for an EXE with the given security,
+    /// architecture, and version.
+    ///
+    /// tbyb: Try Before You Buy, this marks the image to not be booted unless explicitly asked
+    /// for with a FlashUpdate reboot.
+    pub const fn arch_exe(security: Security, architecture: Architecture, major: u16, minor: u16, tbyb: bool) -> Self {
+        let [version_header, version_info] = item_version_no_rollback(major, minor);
+        Self::new([
+            item_image_type_exe(security, architecture, tbyb),
+            version_header,
+            version_info,
+        ])
+    }
+
+    /// Construct a new IMAGE_DEF Block, for an EXE with the given security and version.
+    ///
+    /// The target architecture is taken from the current build target (i.e. Arm
+    /// or RISC-V).
+    ///
+    /// tbyb: Try Before You Buy, this marks the image to not be booted unless explicitly asked
+    /// for with a FlashUpdate reboot.
+    pub const fn exe(security: Security, major: u16, minor: u16, tbyb: bool) -> Self {
+        if cfg!(all(target_arch = "riscv32", target_os = "none")) {
+            Self::arch_exe(security, Architecture::Riscv, major, minor, tbyb)
+        } else {
+            Self::arch_exe(security, Architecture::Arm, major, minor, tbyb)
+        }
+    }
+
+    /// Construct a new IMAGE_DEF Block, for a Non-Secure EXE with the given version.
+    ///
+    /// The target architecture is taken from the current build target (i.e. Arm
+    /// or RISC-V).
+    ///
+    /// tbyb: Try Before You Buy, this marks the image to not be booted unless explicitly asked
+    /// for with a FlashUpdate reboot.
+    pub const fn non_secure_exe(major: u16, minor: u16, tbyb: bool) -> Self {
+        Self::exe(Security::NonSecure, major, minor, tbyb)
+    }
+
+    /// Construct a new IMAGE_DEF Block, for a Secure EXE with the given version.
+    ///
+    /// The target architecture is taken from the current build target (i.e. Arm
+    /// or RISC-V).
+    pub const fn secure_exe(major: u16, minor: u16, tbyb: bool) -> Self {
+        Self::exe(Security::Secure, major, minor, tbyb)
+    }
+}
+
 /// We make our partition table this fixed size.
 pub const PARTITION_TABLE_MAX_ITEMS: usize = 128;
 
 /// Describes a unpartitioned space
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct UnpartitionedSpace {
     permissions_and_location: u32,
     permissions_and_flags: u32,
@@ -278,7 +335,7 @@ impl UnpartitionedSpace {
 
     /// Get the partition start and end
     ///
-    /// The offsets are in bytes, inclusive.
+    /// These are offsets from FLASH_BASE in bytes, inclusive.
     pub fn get_first_last_bytes(&self) -> (u32, u32) {
         let (first, last) = self.get_first_last_sectors();
         (u32::from(first) * 4096, (u32::from(last) * 4096) + 4095)
@@ -341,6 +398,7 @@ impl core::fmt::Display for UnpartitionedSpace {
 
 /// Describes a Partition
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Partition {
     permissions_and_location: u32,
     permissions_and_flags: u32,
@@ -368,7 +426,7 @@ impl Partition {
         core::assert!(last_sector < 0x2000);
         core::assert!(first_sector <= last_sector);
         Self {
-            permissions_and_location: (last_sector as u32) << 13 | first_sector as u32,
+            permissions_and_location: ((last_sector as u32) << 13) | first_sector as u32,
             permissions_and_flags: 0,
             id: None,
             extra_families: [0; 4],
@@ -417,6 +475,10 @@ impl Partition {
         }
     }
 
+    const fn has_name_flag(&self) -> bool {
+        (self.permissions_and_flags & Self::FLAGS_HAS_NAME) == Self::FLAGS_HAS_NAME
+    }
+
     /// Set the extra families for the partition.
     ///
     /// You can supply up to four.
@@ -432,9 +494,19 @@ impl Partition {
             extra_families: new_extra_families,
             extra_families_len: extra_families.len(),
             permissions_and_flags: (self.permissions_and_flags & !Self::FLAGS_HAS_EXTRA_FAMILIES_MASK)
-                | (extra_families.len() as u32) << Self::FLAGS_HAS_EXTRA_FAMILIES_SHIFT,
+                | ((extra_families.len() as u32) << Self::FLAGS_HAS_EXTRA_FAMILIES_SHIFT),
             ..self
         }
+    }
+
+    const fn extra_families_len_from_flags(&self) -> usize {
+        ((self.permissions_and_flags & Self::FLAGS_HAS_EXTRA_FAMILIES_MASK) >> Self::FLAGS_HAS_EXTRA_FAMILIES_SHIFT)
+            as usize
+    }
+
+    fn add_extra_family(&mut self, extra_family: u32) {
+        self.extra_families[self.extra_families_len] = extra_family;
+        self.extra_families_len += 1;
     }
 
     /// Set the ID
@@ -444,6 +516,10 @@ impl Partition {
             permissions_and_flags: self.permissions_and_flags | Self::FLAGS_HAS_ID,
             ..self
         }
+    }
+
+    const fn has_id_flag(&self) -> bool {
+        (self.permissions_and_flags & Self::FLAGS_HAS_ID) == Self::FLAGS_HAS_ID
     }
 
     /// Add a link
@@ -584,15 +660,120 @@ impl core::fmt::Display for Partition {
     }
 }
 
+/// Search flash for the address of a block.
+///
+/// Optionally searching for a specific block type.
+/// This will give you the address of the BLOCK_MARKER_START word.
+/// Returns None if no block is found in search range.
+pub fn find_block_start<T: Instance, M: Mode, const FLASH_SIZE: usize>(
+    flash: &mut Flash<T, M, FLASH_SIZE>,
+    start: u32,
+    search_len: u32,
+    block_type: Option<u8>,
+) -> Result<Option<u32>, FlashError> {
+    let mut buffer = [0u8; 4];
+
+    for offset in (start..=start + search_len).step_by(size_of::<u32>()) {
+        flash.untranslated_blocking_read(offset, &mut buffer)?;
+        let word = u32::from_le_bytes(buffer);
+        if word == BLOCK_MARKER_START {
+            if let Some(block_type) = block_type {
+                flash.untranslated_blocking_read(offset + size_of::<u32>() as u32, &mut buffer)?;
+                let word = u32::from_le_bytes(buffer);
+                if item_generic_get_command(word) == block_type {
+                    return Ok(Some(offset));
+                }
+            } else {
+                return Ok(Some(offset));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 /// Describes a partition table.
 ///
 /// Don't store this as a static - make sure you convert it to a block.
 #[derive(Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct PartitionTableBlock {
     /// This must look like a block, including the 1 word header and the 3 word footer.
     contents: [u32; PARTITION_TABLE_MAX_ITEMS],
     /// This value doesn't include the 1 word header or the 3 word footer
     num_items: usize,
+}
+
+/// Error for from_flash functions on Block types
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum BlockFromFlashError {
+    /// Flash Error while trying to read block
+    Flash(FlashError),
+    /// start_address did not actually point to a block
+    StartIsNotBlock,
+    /// The block at the start_address is not the right type
+    WrongBlockType,
+    /// Ran out of space before finding the end of the block
+    NoEndMarker,
+}
+
+/// Iterator over partitions in a partition table.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PartitionTableBlockIter {
+    block: PartitionTableBlock,
+    remaining_partitions: usize,
+    index: usize,
+}
+
+impl Iterator for PartitionTableBlockIter {
+    type Item = Partition;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining_partitions == 0 {
+            None
+        } else {
+            let permissions_and_location = self.block.contents[self.index];
+            self.index += 1;
+
+            let permissions_and_flags = self.block.contents[self.index];
+            self.index += 1;
+
+            let mut partition = Partition::from_raw(permissions_and_location, permissions_and_flags);
+
+            if partition.has_id_flag() {
+                let low = self.block.contents[self.index] as u64;
+                self.index += 1;
+                let hi = self.block.contents[self.index] as u64;
+                self.index += 1;
+
+                partition.id = Some((hi << 32) + low);
+            }
+
+            for _ in 0..partition.extra_families_len_from_flags() {
+                partition.add_extra_family(self.block.contents[self.index]);
+                self.index += 1;
+            }
+
+            if partition.has_name_flag() {
+                // The length byte in the block doesn't include itself
+                let bytes = self.block.contents[self.index].to_le_bytes()[0] + 1;
+                // whole words (bytes / 4) + 1 if there are leftover bytes
+                let words = (bytes / 4) + if bytes % 4 == 0 { 0 } else { 1 };
+                let mut i = 0;
+                for _ in 0..words {
+                    for byte in self.block.contents[self.index].to_le_bytes() {
+                        partition.name[i] = byte;
+                        i += 1;
+                    }
+                    self.index += 1;
+                }
+            }
+
+            self.remaining_partitions -= 1;
+            Some(partition)
+        }
+    }
 }
 
 impl PartitionTableBlock {
@@ -608,8 +789,126 @@ impl PartitionTableBlock {
         PartitionTableBlock { contents, num_items: 0 }
     }
 
+    /// Create an interator over the partitions in the table.
+    pub fn partitions(&self) -> PartitionTableBlockIter {
+        let mut remaining_partitions = 0;
+        let mut index = 0;
+        for word in self.contents {
+            if item_generic_get_command(word) == ITEM_2BS_PARTITION_TABLE {
+                remaining_partitions = item_generic_2bs_get_value(word) as usize;
+                // Skip header and unpartitioned info
+                index += 2;
+                break;
+            }
+            index += 1;
+        }
+
+        PartitionTableBlockIter {
+            block: self.clone(),
+            remaining_partitions,
+            index,
+        }
+    }
+
+    /// Create a PartitionTableBlock by reading out out of flash.
+    pub fn from_flash<T: Instance, M: Mode, const FLASH_SIZE: usize>(
+        flash: &mut Flash<T, M, FLASH_SIZE>,
+        start_address: u32,
+    ) -> Result<PartitionTableBlock, BlockFromFlashError> {
+        let mut buf = [0u8; 4];
+        let mut contents = [0; PARTITION_TABLE_MAX_ITEMS];
+        let mut i = 0;
+        let mut addr = start_address;
+
+        // Check that start_address is actually the start of a block
+        flash
+            .untranslated_blocking_read(addr, &mut buf)
+            .map_err(BlockFromFlashError::Flash)?;
+        addr += size_of::<u32>() as u32;
+        let start_word = u32::from_le_bytes(buf);
+        if start_word != BLOCK_MARKER_START {
+            return Err(BlockFromFlashError::StartIsNotBlock);
+        }
+        contents[i] = start_word;
+        i += 1;
+
+        // Check that our block really is a partition table
+        flash
+            .untranslated_blocking_read(addr, &mut buf)
+            .map_err(BlockFromFlashError::Flash)?;
+        addr += size_of::<u32>() as u32;
+        let header_word = u32::from_le_bytes(buf);
+        if item_generic_get_command(header_word) != ITEM_2BS_PARTITION_TABLE {
+            return Err(BlockFromFlashError::WrongBlockType);
+        }
+        contents[i] = header_word;
+        i += 1;
+
+        loop {
+            flash
+                .untranslated_blocking_read(addr, &mut buf)
+                .map_err(BlockFromFlashError::Flash)?;
+
+            let word = u32::from_le_bytes(buf);
+            contents[i] = word;
+
+            if word == BLOCK_MARKER_END {
+                break;
+            }
+
+            addr += size_of::<u32>() as u32;
+            i += 1;
+
+            // Jump ship if we run out of space. This will only happen with a malformed block.
+            if i == PARTITION_TABLE_MAX_ITEMS {
+                return Err(BlockFromFlashError::NoEndMarker);
+            }
+        }
+
+        // num_items does not include the header or footer words
+        let num_items = i - 3;
+
+        Ok(PartitionTableBlock { contents, num_items })
+    }
+
+    /// Find the partition with the given ID
+    pub fn get_partition_by_id(&self, id: u64) -> Option<Partition> {
+        self.partitions().find(|part| Some(id) == part.get_id())
+    }
+
+    /// Find the partition with the given ID
+    pub fn get_partition_by_name(&self, name: &str) -> Option<Partition> {
+        self.partitions().find(|part| Some(name) == part.get_name())
+    }
+
+    /// Find the partition we're executing from.
+    #[cfg(feature = "_rp235x")]
+    pub fn get_active_partition(&self) -> Option<Partition> {
+        let atrans_base = crate::pac::QMI.atrans(0).read().base();
+        self.partitions().find(|part| {
+            let (first, _) = part.get_first_last_sectors();
+            atrans_base == first
+        })
+    }
+
+    /// Find the inactive partition in the A/B pair we're executing from.
+    #[cfg(feature = "_rp235x")]
+    pub fn get_inactive_partition(&self) -> Option<Partition> {
+        let active = self.get_active_partition()?;
+
+        // active partition is a "B" and we can just follow the link.
+        if let Link::ToA { partition_idx } = active.get_link() {
+            return self.get_partition_by_id(partition_idx.into());
+        }
+
+        // active partition is a "A" and we need to search for a "B".
+        let id = active.get_id()? as u8;
+        self.partitions()
+            .find(|part| Link::ToA { partition_idx: id } == part.get_link())
+    }
+
     /// Add a partition to the partition table
-    pub const fn add_partition_item(self, unpartitioned: UnpartitionedSpace, partitions: &[Partition]) -> Self {
+    pub fn add_partition_item(self, unpartitioned: UnpartitionedSpace, partitions: &[Partition]) -> Self {
         let mut new_table = PartitionTableBlock::new();
         let mut idx = 0;
         // copy over old table, with the header but not the footer
@@ -660,7 +959,8 @@ impl PartitionTableBlock {
 
             // e. Name
             let mut name_idx = 0;
-            while name_idx < partitions[partition_no].name[0] as usize {
+            // The length in the name doesn't include the length itself, so add 1
+            while name_idx < 1 + partitions[partition_no].name[0] as usize {
                 let name_chunk = [
                     partitions[partition_no].name[name_idx],
                     partitions[partition_no].name[name_idx + 1],
@@ -701,7 +1001,7 @@ impl PartitionTableBlock {
         // 1. add item
         new_table.contents[idx] = item_generic_2bs(0, 2, ITEM_1BS_VERSION);
         idx += 1;
-        new_table.contents[idx] = (major as u32) << 16 | minor as u32;
+        new_table.contents[idx] = ((major as u32) << 16) | minor as u32;
         idx += 1;
 
         // 2. New Footer
@@ -714,7 +1014,25 @@ impl PartitionTableBlock {
         new_table
     }
 
-    /// Add a SHA256 hash of the Block
+    /// Get the version of the partition table (major, minor)
+    pub fn get_version(&self) -> Option<(u16, u16)> {
+        let mut iter = self.contents.iter();
+        while let Some(word) = iter.next() {
+            if item_generic_get_command(*word) == ITEM_1BS_VERSION {
+                if let Some(ver_word) = iter.next() {
+                    let bytes = ver_word.to_le_bytes();
+                    return Some((
+                        u16::from_le_bytes([bytes[2], bytes[3]]),
+                        u16::from_le_bytes([bytes[0], bytes[1]]),
+                    ));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Add a a SHA256 hash of the Block
     ///
     /// Adds a `HASH_DEF` covering all the previous items in the Block, and a
     /// `HASH_VALUE` with a SHA-256 hash of them.
@@ -775,6 +1093,7 @@ impl Default for PartitionTableBlock {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
 #[allow(missing_docs)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum PartitionFlag {
     NotBootableArm = 1 << 9,
     NotBootableRiscv = 1 << 10,
@@ -791,6 +1110,7 @@ pub enum PartitionFlag {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
 #[allow(missing_docs)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum UnpartitionedFlag {
     Uf2DownloadNoReboot = 1 << 13,
     AcceptsDefaultFamilyRp2040 = 1 << 14,
@@ -803,6 +1123,7 @@ pub enum UnpartitionedFlag {
 
 /// Kinds of linked partition
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Link {
     /// Not linked to anything
     Nothing,
@@ -882,11 +1203,40 @@ pub const fn item_generic_1bs(value: u16, length: u8, command: u8) -> u32 {
     ((value as u32) << 16) | ((length as u32) << 8) | (command as u32)
 }
 
+/// Extract the value portion of a 1BS item
+pub const fn item_generic_1bs_get_value(item: u32) -> u16 {
+    let bytes = item.to_le_bytes();
+
+    u16::from_le_bytes([bytes[2], bytes[3]])
+}
+
+/// Extract the length portion of a 1BS item
+pub const fn item_generic_1bs_get_length(item: u32) -> u8 {
+    item.to_le_bytes()[1]
+}
+
 /// Make an item containing a tag, 2 byte length and one extra byte.
 ///
 /// The `command` arg should contain `2BS`
 pub const fn item_generic_2bs(value: u8, length: u16, command: u8) -> u32 {
     ((value as u32) << 24) | ((length as u32) << 8) | (command as u32)
+}
+
+/// Extract the value portion of a 2BS item
+pub const fn item_generic_2bs_get_value(item: u32) -> u8 {
+    item.to_le_bytes()[3]
+}
+
+/// Extract the length portion of a 2BS item
+pub const fn item_generic_2bs_get_length(item: u32) -> u16 {
+    let bytes = item.to_le_bytes();
+
+    u16::from_le_bytes([bytes[1], bytes[2]])
+}
+
+/// Extract the command portion of an item. 1BS and 2BS items store the command in the same way.
+pub const fn item_generic_get_command(item: u32) -> u8 {
+    item.to_le_bytes()[0]
 }
 
 /// Create Image Type item, of type IGNORED.
@@ -907,7 +1257,10 @@ pub const fn item_image_type_data() -> u32 {
 }
 
 /// Create Image Type item, of type EXE.
-pub const fn item_image_type_exe(security: Security, arch: Architecture) -> u32 {
+///
+/// tbyb: Try Before You Buy, this marks the image to not be booted unless explicitly asked
+/// for with a FlashUpdate reboot.
+pub const fn item_image_type_exe(security: Security, arch: Architecture, tbyb: bool) -> u32 {
     let mut value = IMAGE_TYPE_EXE | IMAGE_TYPE_EXE_CHIP_RP2350;
 
     match arch {
@@ -925,7 +1278,19 @@ pub const fn item_image_type_exe(security: Security, arch: Architecture) -> u32 
         Security::Secure => value |= IMAGE_TYPE_EXE_TYPE_SECURITY_S,
     }
 
+    if tbyb {
+        value |= IMAGE_TYPE_TBYB;
+    }
+
     item_generic_1bs(value, 1, ITEM_1BS_IMAGE_TYPE)
+}
+
+/// Create an version item without rollback protection
+pub const fn item_version_no_rollback(major: u16, minor: u16) -> [u32; 2] {
+    [
+        item_generic_1bs(0, 2, ITEM_1BS_VERSION),
+        ((major as u32) << 16) | minor as u32,
+    ]
 }
 
 /// Create a Block Last item.

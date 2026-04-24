@@ -33,6 +33,8 @@ pub mod dma;
 #[cfg(any(feature = "executor-thread", feature = "executor-interrupt"))]
 pub mod executor;
 pub mod flash;
+#[cfg(feature = "_rp235x")]
+pub mod flash_partitions;
 #[cfg(feature = "rp2040")]
 mod float;
 pub mod gpio;
@@ -47,6 +49,8 @@ pub mod psram;
 pub mod pwm;
 #[cfg(feature = "_rp235x")]
 pub mod qmi_cs1;
+#[cfg(feature = "_rp235x")]
+pub mod reboot;
 mod reset;
 pub mod rom_data;
 #[cfg(feature = "rp2040")]
